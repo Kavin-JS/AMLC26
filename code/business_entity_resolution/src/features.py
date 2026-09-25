@@ -7,6 +7,7 @@ from __future__ import annotations
 import re
 from typing import List, Tuple
 
+# pyrefly: ignore [missing-import]
 import numpy as np
 import pandas as pd
 

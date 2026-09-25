@@ -52,7 +52,6 @@ MAX_TOK1      = 10      # cap single-token candidates
 STREAM_CHUNK  = 200_000
 FEAT_BATCH    = 50_000
 SEED          = 42
-S1_TEST_BATCH = 20_000   # test S1 entities processed per outer batch (memory-safe test inference)
 
 FEATURE_NAMES = [
     "name_tok_jac", "name_c3_jac", "name_c4_jac", "name_lcp",
@@ -544,176 +543,144 @@ def run_pipeline(
     del val_pairs, val_sc, pred_map, s1_lk, s23_lk, tr_s1, val_s1, tr_cands, val_cands, gt_map
     gc.collect()
 
-    # ── 7. Preprocess Test, Score, and Output (batched / streaming) ────────
-    #
-    # Memory-safety strategy: test Source 1 (~1.73M rows) is streamed and
-    # processed in outer batches of S1_TEST_BATCH entities. For each S1
-    # batch we build blocking keys scoped to just that batch, stream
-    # test_source2.tsv / test_source3.tsv (STREAM_CHUNK rows at a time) and
-    # keep only the S2/S3 rows that could plausibly match this batch. This
-    # avoids ever materializing the full ~8.5M-row / ~4.9GB filtered S2/S3
-    # DataFrame or a single all-pairs candidate list. Candidate generation,
-    # feature computation, scoring, and output writing all happen per batch
-    # (and per FEAT_BATCH sub-batch within scoring), with results streamed
-    # directly to disk so nothing about the full test set is retained
-    # across batches.
-    log.info("=== 7/7: Scoring test set and generating submissions (batched) ===")
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    # ── 7. Preprocess Test, Score, and Output ──────────────────────────────
+    log.info("=== 7/7: Scoring test set and generating submissions ===")
+    log.info("  Preprocessing test_source1.tsv...")
+    t0 = time.time()
+    test_s1_chunks = []
+    for chunk in pd.read_csv(DATA_TEST / "test_source1.tsv", sep="\t", dtype=str, chunksize=STREAM_CHUNK):
+        chunk = chunk.fillna("")
+        chunk["norm_name"] = vec_norm_name(chunk["business_name"])
+        chunk["norm_addr"] = vec_norm_addr(chunk["business_address"])
+        chunk["tok1_name"] = chunk["norm_name"].apply(tok1)
+        chunk["tok2_name"] = chunk["norm_name"].apply(tok2)
+        test_s1_chunks.append(chunk[["entity_id", "country", "business_name", "business_address",
+                                     "norm_name", "norm_addr", "tok1_name", "tok2_name"]])
+    test_s1 = pd.concat(test_s1_chunks, ignore_index=True)
+    del test_s1_chunks
+    gc.collect()
+    log.info("  Test S1: %d entities in %.1fs", len(test_s1), time.time() - t0)
+
+    test_s1_ids_ordered = test_s1["entity_id"].tolist()
+    test_countries = set(test_s1["country"])
+    test_names     = set(test_s1["norm_name"]) - {""}
+    test_tok2      = set(test_s1["tok2_name"]) - {""}
+    test_tok1      = set(test_s1["tok1_name"]) - {""}
+    test_addrs     = set(test_s1["norm_addr"]) - {""}
+
+    log.info("  Preprocessing and filtering test S2/S3 against test S1 blocking keys...")
+    test_s23_chunks = []
+    for path in [DATA_TEST / "test_source2.tsv", DATA_TEST / "test_source3.tsv"]:
+        log.info("  Reading %s …", path.name)
+        c_num = 0
+        for chunk in pd.read_csv(path, sep="\t", dtype=str, chunksize=STREAM_CHUNK):
+            chunk = chunk.fillna("")
+            chunk = chunk[chunk["country"].isin(test_countries)].copy()
+            if chunk.empty:
+                continue
+
+            chunk["norm_name"] = vec_norm_name(chunk["business_name"])
+            chunk["norm_addr"] = vec_norm_addr(chunk["business_address"])
+            chunk["tok1_name"] = chunk["norm_name"].apply(tok1)
+            chunk["tok2_name"] = chunk["norm_name"].apply(tok2)
+
+            keep_mask = (
+                chunk["norm_name"].isin(test_names)
+                | chunk["tok2_name"].isin(test_tok2)
+                | chunk["norm_addr"].isin(test_addrs)
+                | chunk["tok1_name"].isin(test_tok1)
+            )
+            filtered = chunk[keep_mask]
+            if not filtered.empty:
+                test_s23_chunks.append(filtered[["entity_id", "country", "business_name", "business_address",
+                                                 "norm_name", "norm_addr", "tok1_name", "tok2_name"]])
+            c_num += 1
+            if c_num % 5 == 0:
+                log.info("    %s: chunk %d processed...", path.name, c_num)
+
+    test_s23 = pd.concat(test_s23_chunks, ignore_index=True)
+    del test_s23_chunks, test_countries, test_names, test_tok2, test_tok1, test_addrs
+    gc.collect()
+    log.info("  Filtered test S2+S3: %d candidate rows (~%.0f MB)",
+             len(test_s23), test_s23.memory_usage(deep=True).sum() / 1e6)
+
+    # Block test
+    log.info("  Blocking test set...")
+    test_cands = block_by_join(test_s1, test_s23, max_cands, max_tok1)
+    n_with_cands = sum(1 for v in test_cands.values() if v)
+    log.info("  %d / %d test S1 have candidates (%.1f%%)",
+             n_with_cands, len(test_s1), 100 * n_with_cands / max(len(test_s1), 1))
+
+    # Build test lookups
+    test_s1_lk: RecordLookup = df_to_lookup(test_s1)
+    del test_s1
+    gc.collect()
+
+    needed_test_s23: Set[str] = set()
+    for v in test_cands.values():
+        needed_test_s23.update(v)
+
+    sub_test_s23 = test_s23[test_s23["entity_id"].isin(needed_test_s23)]
+    test_s23_lk: RecordLookup = {
+        eid: (norm_n, norm_a, cty, b_name, b_addr)
+        for eid, norm_n, norm_a, cty, b_name, b_addr in zip(
+            sub_test_s23["entity_id"], sub_test_s23["norm_name"], sub_test_s23["norm_addr"],
+            sub_test_s23["country"], sub_test_s23["business_name"], sub_test_s23["business_address"]
+        )
+    }
+    del test_s23, sub_test_s23, needed_test_s23
+    gc.collect()
+
+    # Score test pairs
+    all_test_pairs = [
+        (s1_id, cid)
+        for s1_id, cset in test_cands.items()
+        for cid in cset
+    ]
+    log.info("  Scoring %d candidate pairs...", len(all_test_pairs))
+
+    match_map: Dict[str, Set[str]] = {}
+    t0 = time.time()
+    for start in range(0, len(all_test_pairs), FEAT_BATCH):
+        batch = all_test_pairs[start:start+FEAT_BATCH]
+        X_b = compute_features(batch, test_s1_lk, test_s23_lk)
+        sc_b = clf.predict_proba(X_b)[:, 1]
+        for (s1_id, cid), sc in zip(batch, sc_b):
+            if sc >= best_t:
+                match_map.setdefault(s1_id, set()).add(cid)
+        if start > 0 and (start % (FEAT_BATCH * 10) == 0 or start + FEAT_BATCH >= len(all_test_pairs)):
+            log.info("  Scored %d / %d pairs (%.1fs)", min(start + FEAT_BATCH, len(all_test_pairs)),
+                     len(all_test_pairs), time.time() - t0)
+
+    log.info("  Scoring complete in %.1fs", time.time() - t0)
+    del test_s1_lk, test_s23_lk, all_test_pairs
+    gc.collect()
+
+    # Write output TSVs
+    log.info("  Writing submission files...")
+    matching_rows, cand_rows = [], []
+    for s1_id in test_s1_ids_ordered:
+        matched = sorted(match_map.get(s1_id, set()))
+        cands   = sorted(test_cands.get(s1_id, set()))
+        matching_rows.append({"source1_entity_id": s1_id, "matched_entity_ids": ",".join(matched)})
+        cand_rows.append({"source1_entity_id": s1_id, "candidate_entity_ids": ",".join(cands)})
 
     matching_path = OUTPUT_DIR / "matching_results.tsv"
     cand_path     = OUTPUT_DIR / "candidate_pairs.tsv"
 
-    s23_cols = ["entity_id", "country", "business_name", "business_address",
-                "norm_name", "norm_addr", "tok1_name", "tok2_name"]
+    pd.DataFrame(matching_rows).to_csv(matching_path, sep="\t", index=False)
+    pd.DataFrame(cand_rows).to_csv(cand_path, sep="\t", index=False)
 
-    total_s1          = 0
-    total_matched     = 0
-    total_cand_pairs  = 0
-    batch_num         = 0
-    t_start = time.time()
-
-    with open(matching_path, "w", encoding="utf-8", newline="") as mf, \
-         open(cand_path, "w", encoding="utf-8", newline="") as cf:
-
-        mf.write("source1_entity_id\tmatched_entity_ids\n")
-        cf.write("source1_entity_id\tcandidate_entity_ids\n")
-
-        for s1_chunk in pd.read_csv(DATA_TEST / "test_source1.tsv", sep="\t", dtype=str,
-                                     chunksize=S1_TEST_BATCH):
-            batch_num += 1
-            t_batch = time.time()
-
-            s1_chunk = s1_chunk.fillna("")
-            s1_chunk["norm_name"] = vec_norm_name(s1_chunk["business_name"])
-            s1_chunk["norm_addr"] = vec_norm_addr(s1_chunk["business_address"])
-            s1_chunk["tok1_name"] = s1_chunk["norm_name"].apply(tok1)
-            s1_chunk["tok2_name"] = s1_chunk["norm_name"].apply(tok2)
-            s1_batch = s1_chunk[["entity_id", "country", "business_name", "business_address",
-                                  "norm_name", "norm_addr", "tok1_name", "tok2_name"]].reset_index(drop=True)
-            del s1_chunk
-
-            batch_ids_ordered = s1_batch["entity_id"].tolist()
-            total_s1 += len(batch_ids_ordered)
-            log.info("  [batch %d] test S1 rows: %d (cumulative %d)",
-                     batch_num, len(batch_ids_ordered), total_s1)
-
-            # Blocking keys scoped to this S1 batch only.
-            b_countries = set(s1_batch["country"])
-            b_names     = set(s1_batch["norm_name"]) - {""}
-            b_tok2      = set(s1_batch["tok2_name"]) - {""}
-            b_tok1      = set(s1_batch["tok1_name"]) - {""}
-            b_addrs     = set(s1_batch["norm_addr"]) - {""}
-
-            # Stream S2/S3, keeping only rows relevant to this batch.
-            s23_parts = []
-            for path in [DATA_TEST / "test_source2.tsv", DATA_TEST / "test_source3.tsv"]:
-                c_num = 0
-                for chunk in pd.read_csv(path, sep="\t", dtype=str, chunksize=STREAM_CHUNK):
-                    chunk = chunk.fillna("")
-                    chunk = chunk[chunk["country"].isin(b_countries)]
-                    if chunk.empty:
-                        c_num += 1
-                        continue
-                    chunk = chunk.copy()
-                    chunk["norm_name"] = vec_norm_name(chunk["business_name"])
-                    chunk["norm_addr"] = vec_norm_addr(chunk["business_address"])
-                    chunk["tok1_name"] = chunk["norm_name"].apply(tok1)
-                    chunk["tok2_name"] = chunk["norm_name"].apply(tok2)
-
-                    keep_mask = (
-                        chunk["norm_name"].isin(b_names)
-                        | chunk["tok2_name"].isin(b_tok2)
-                        | chunk["norm_addr"].isin(b_addrs)
-                        | chunk["tok1_name"].isin(b_tok1)
-                    )
-                    filtered = chunk[keep_mask]
-                    if not filtered.empty:
-                        s23_parts.append(filtered[s23_cols])
-                    c_num += 1
-                    del chunk
-                    if c_num % 10 == 0:
-                        log.info("    [batch %d] %s: chunk %d streamed...", batch_num, path.name, c_num)
-
-            batch_s23 = pd.concat(s23_parts, ignore_index=True) if s23_parts else pd.DataFrame(columns=s23_cols)
-            del s23_parts, b_countries, b_names, b_tok2, b_tok1, b_addrs
-            gc.collect()
-            log.info("  [batch %d] candidate pool rows: %d (~%.1f MB)",
-                     batch_num, len(batch_s23), batch_s23.memory_usage(deep=True).sum() / 1e6)
-
-            # Blocking (reuses the existing vectorized join logic, scoped to this batch).
-            batch_cands = block_by_join(s1_batch, batch_s23, max_cands, max_tok1)
-            n_with_cands = sum(1 for v in batch_cands.values() if v)
-            log.info("  [batch %d] %d / %d S1 entities have candidates",
-                     batch_num, n_with_cands, len(batch_ids_ordered))
-
-            # Compact lookups for this batch only.
-            s1_lk_b: RecordLookup = df_to_lookup(s1_batch)
-            del s1_batch
-            gc.collect()
-
-            needed_b: Set[str] = set()
-            for v in batch_cands.values():
-                needed_b.update(v)
-            sub_s23_b = batch_s23[batch_s23["entity_id"].isin(needed_b)]
-            s23_lk_b: RecordLookup = {
-                eid: (norm_n, norm_a, cty, b_name, b_addr)
-                for eid, norm_n, norm_a, cty, b_name, b_addr in zip(
-                    sub_s23_b["entity_id"], sub_s23_b["norm_name"], sub_s23_b["norm_addr"],
-                    sub_s23_b["country"], sub_s23_b["business_name"], sub_s23_b["business_address"]
-                )
-            }
-            del batch_s23, sub_s23_b, needed_b
-            gc.collect()
-
-            # Candidate pairs for this batch (never accumulated across batches).
-            pairs_b = [(s1_id, cid) for s1_id, cset in batch_cands.items() for cid in cset]
-            total_cand_pairs += len(pairs_b)
-            log.info("  [batch %d] scoring %d candidate pairs...", batch_num, len(pairs_b))
-
-            match_map_b: Dict[str, Set[str]] = {}
-            for start in range(0, len(pairs_b), FEAT_BATCH):
-                sub_pairs = pairs_b[start:start + FEAT_BATCH]
-                X_b = compute_features(sub_pairs, s1_lk_b, s23_lk_b)
-                sc_b = clf.predict_proba(X_b)[:, 1] if len(X_b) else np.array([])
-                for (s1_id, cid), sc in zip(sub_pairs, sc_b):
-                    if sc >= best_t:
-                        match_map_b.setdefault(s1_id, set()).add(cid)
-                del X_b, sc_b, sub_pairs
-                if start > 0 and (start % (FEAT_BATCH * 10) == 0 or start + FEAT_BATCH >= len(pairs_b)):
-                    log.info("    [batch %d] scored %d / %d pairs", batch_num,
-                             min(start + FEAT_BATCH, len(pairs_b)), len(pairs_b))
-
-            del pairs_b, s1_lk_b, s23_lk_b
-            gc.collect()
-
-            # Stream results for this batch straight to disk, preserving S1 file order.
-            for s1_id in batch_ids_ordered:
-                matched = sorted(match_map_b.get(s1_id, set()))
-                cset    = sorted(batch_cands.get(s1_id, set()))
-                mf.write(f"{s1_id}\t{','.join(matched)}\n")
-                cf.write(f"{s1_id}\t{','.join(cset)}\n")
-
-            batch_matched = sum(1 for v in match_map_b.values() if v)
-            total_matched += batch_matched
-
-            del batch_cands, match_map_b, batch_ids_ordered
-            gc.collect()
-
-            log.info("  [batch %d] matched %d entities (cumulative %d / %d) — batch time %.1fs, total %.1fs",
-                     batch_num, batch_matched, total_matched, total_s1,
-                     time.time() - t_batch, time.time() - t_start)
-
-    n_singleton = total_s1 - total_matched
+    n_matched   = sum(1 for v in match_map.values() if v)
+    n_singleton = len(test_s1_ids_ordered) - n_matched
 
     log.info("=" * 60)
     log.info("PIPELINE SUMMARY:")
     log.info("  Train blocking recall: %.4f", tr_rec)
     log.info("  Val   blocking recall: %.4f", val_rec)
     log.info("  Val Macro F0.5:        %.4f (threshold = %.3f)", val_f05, best_t)
-    log.info("  Test S1 batches:       %d (batch size = %d)", batch_num, S1_TEST_BATCH)
-    log.info("  Test candidate pairs:  %d", total_cand_pairs)
-    log.info("  Test S1 with matches:  %d / %d (%.1f%%)", total_matched, total_s1,
-             100 * total_matched / max(total_s1, 1))
+    log.info("  Test S1 with matches:  %d / %d (%.1f%%)", n_matched, len(test_s1_ids_ordered),
+             100 * n_matched / max(len(test_s1_ids_ordered), 1))
     log.info("  Test singletons (0 m): %d", n_singleton)
     log.info("  Output saved to:")
     log.info("    %s", matching_path)

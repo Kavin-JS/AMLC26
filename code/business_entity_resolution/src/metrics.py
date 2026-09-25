@@ -5,6 +5,7 @@ Evaluation: entity-level macro F0.5.
 from __future__ import annotations
 
 from typing import Dict, Set
+# pyrefly: ignore [missing-import]
 import numpy as np
 
 

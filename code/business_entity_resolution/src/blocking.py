@@ -16,6 +16,7 @@ import logging
 from collections import defaultdict
 from typing import Dict, Set
 
+# pyrefly: ignore [missing-import]
 import numpy as np
 import pandas as pd
 from sklearn.feature_extraction.text import TfidfVectorizer
@@ -107,6 +108,7 @@ def _tfidf_block(
     batch_size: int = 2000,
 ) -> Dict[str, Set[str]]:
     """TF-IDF character 3-gram approximate blocking within each country."""
+    # pyrefly: ignore [missing-import]
     from scipy.sparse import csr_matrix
 
     cands: Dict[str, Set[str]] = defaultdict(set)
