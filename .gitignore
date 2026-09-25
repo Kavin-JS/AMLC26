@@ -1,0 +1,18 @@
+# Competition data
+data/
+dataset/
+*.tsv
+*.zip
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Outputs
+output/
+
+# IDE
+.vscode/
+.idea/
