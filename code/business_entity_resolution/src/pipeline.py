@@ -14,7 +14,9 @@ from __future__ import annotations
 
 import argparse
 import gc
+import json
 import logging
+import os
 import random
 import re
 import sys
@@ -49,10 +51,10 @@ TRAIN_SAMPLE  = 200_000
 VAL_FRAC      = 0.15
 MAX_CANDS     = 60
 MAX_TOK1      = 10      # cap single-token candidates
-STREAM_CHUNK  = 200_000
-FEAT_BATCH    = 50_000
+STREAM_CHUNK  = 100_000
+FEAT_BATCH    = 25_000
 SEED          = 42
-S1_TEST_BATCH = 20_000   # test S1 entities processed per outer batch (memory-safe test inference)
+S1_TEST_BATCH = 10_000   # test S1 entities processed per outer batch (memory-safe test inference)
 
 FEATURE_NAMES = [
     "name_tok_jac", "name_c3_jac", "name_c4_jac", "name_lcp",
@@ -342,6 +344,52 @@ def recall_at_k(cands: Dict[str, Set[str]], gt: Dict[str, Set[str]]) -> float:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# Checkpoint / resume helpers (used by the batched test-inference stage)
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _count_data_rows(path: Path) -> int:
+    """Fast newline-count of a TSV's data rows (excludes header). Pure I/O,
+    no parsing — safe/cheap to run once even on multi-million-row files."""
+    n_newlines = 0
+    last_byte = b""
+    with open(path, "rb") as f:
+        while True:
+            buf = f.read(1 << 20)
+            if not buf:
+                break
+            n_newlines += buf.count(b"\n")
+            last_byte = buf[-1:]
+    if last_byte and last_byte != b"\n":
+        n_newlines += 1  # final line has content but no trailing newline
+    return max(n_newlines - 1, 0)  # subtract the header line
+
+
+def _write_checkpoint_atomic(path: Path, state: dict) -> None:
+    """Write a JSON checkpoint atomically (tmp file + fsync + os.replace) so a
+    crash mid-write never leaves a corrupt or half-written checkpoint on disk."""
+    tmp_path = path.parent / (path.name + ".tmp")
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(state, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, path)
+
+
+def _load_checkpoint(path: Path) -> Optional[dict]:
+    """Load a checkpoint JSON if present and readable; returns None (and logs
+    a warning) if it is missing or corrupt, so callers always restart cleanly."""
+    if not path.exists():
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        log.warning("  Checkpoint file at %s is unreadable/corrupt — ignoring it "
+                     "and restarting the test stage from scratch.", path)
+        return None
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # Main pipeline
 # ═════════════════════════════════════════════════════════════════════════════
 
@@ -544,164 +592,287 @@ def run_pipeline(
     del val_pairs, val_sc, pred_map, s1_lk, s23_lk, tr_s1, val_s1, tr_cands, val_cands, gt_map
     gc.collect()
 
-    # ── 7. Preprocess Test, Score, and Output (batched / streaming) ────────
+    # ── 7. Preprocess Test, Score, and Output (batched / streaming, resumable) ─
     #
-    # Memory-safety strategy: test Source 1 (~1.73M rows) is streamed and
+    # Memory-safety strategy: test Source 1 (~1.7M rows) is streamed and
     # processed in outer batches of S1_TEST_BATCH entities. For each S1
     # batch we build blocking keys scoped to just that batch, stream
     # test_source2.tsv / test_source3.tsv (STREAM_CHUNK rows at a time) and
     # keep only the S2/S3 rows that could plausibly match this batch. This
-    # avoids ever materializing the full ~8.5M-row / ~4.9GB filtered S2/S3
-    # DataFrame or a single all-pairs candidate list. Candidate generation,
-    # feature computation, scoring, and output writing all happen per batch
-    # (and per FEAT_BATCH sub-batch within scoring), with results streamed
+    # avoids ever materializing the full filtered S2/S3 DataFrame or a
+    # single all-pairs candidate list. Candidate generation, feature
+    # computation, scoring, and output writing all happen per batch (and
+    # per FEAT_BATCH sub-batch within scoring), with results streamed
     # directly to disk so nothing about the full test set is retained
     # across batches.
-    log.info("=== 7/7: Scoring test set and generating submissions (batched) ===")
+    #
+    # Crash/resume strategy: after every fully-completed batch, both output
+    # files are flushed + fsync'd and a checkpoint JSON (byte offsets +
+    # cumulative counters) is written atomically (tmp file + os.replace).
+    # On restart, the checkpoint's offsets are used to truncate both output
+    # files back to the last confirmed-good state (discarding any
+    # partially-written batch), and processing resumes at the next
+    # unprocessed S1 row — so a shutdown mid-batch causes only that one
+    # batch to be safely rerun, a fully-completed batch is never redone,
+    # and no row is ever duplicated in the outputs.
+    log.info("=== 7/7: Scoring test set and generating submissions (batched, resumable) ===")
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    SCRATCH.mkdir(parents=True, exist_ok=True)
 
-    matching_path = OUTPUT_DIR / "matching_results.tsv"
-    cand_path     = OUTPUT_DIR / "candidate_pairs.tsv"
+    matching_path   = OUTPUT_DIR / "matching_results.tsv"
+    cand_path       = OUTPUT_DIR / "candidate_pairs.tsv"
+    checkpoint_path = SCRATCH / "test_stage_checkpoint.json"
 
     s23_cols = ["entity_id", "country", "business_name", "business_address",
                 "norm_name", "norm_addr", "tok1_name", "tok2_name"]
 
-    total_s1          = 0
-    total_matched     = 0
-    total_cand_pairs  = 0
-    batch_num         = 0
-    t_start = time.time()
+    total_test_s1_rows = _count_data_rows(DATA_TEST / "test_source1.tsv")
+    log.info("  Total test S1 rows to process: %d", total_test_s1_rows)
 
-    with open(matching_path, "w", encoding="utf-8", newline="") as mf, \
-         open(cand_path, "w", encoding="utf-8", newline="") as cf:
+    ckpt = _load_checkpoint(checkpoint_path)
+    resume_valid = (
+        ckpt is not None
+        and ckpt.get("s1_test_batch") == S1_TEST_BATCH
+        and ckpt.get("max_cands") == max_cands
+        and ckpt.get("max_tok1") == max_tok1
+        and ckpt.get("total_test_s1_rows") == total_test_s1_rows
+    )
+    if ckpt is not None and not resume_valid:
+        log.warning("  Checkpoint found but run parameters/input differ from it — "
+                     "restarting the test stage from scratch (old checkpoint discarded).")
 
-        mf.write("source1_entity_id\tmatched_entity_ids\n")
-        cf.write("source1_entity_id\tcandidate_entity_ids\n")
+    if resume_valid and ckpt.get("completed"):
+        batch_num        = ckpt["batch_num"]
+        total_s1         = ckpt["rows_completed"]
+        total_matched    = ckpt["total_matched"]
+        total_cand_pairs = ckpt["total_cand_pairs"]
+        log.info("  Test stage already fully completed in a previous run "
+                 "(%d / %d rows) — skipping recomputation.", total_s1, total_test_s1_rows)
 
-        for s1_chunk in pd.read_csv(DATA_TEST / "test_source1.tsv", sep="\t", dtype=str,
-                                     chunksize=S1_TEST_BATCH):
-            batch_num += 1
-            t_batch = time.time()
+    else:
+        if resume_valid and ckpt.get("rows_completed", 0) > 0:
+            batch_num        = ckpt["batch_num"]
+            rows_completed   = ckpt["rows_completed"]
+            total_matched    = ckpt["total_matched"]
+            total_cand_pairs = ckpt["total_cand_pairs"]
+            elapsed_before   = ckpt.get("elapsed_seconds", 0.0)
+            matching_offset  = ckpt["matching_offset"]
+            cand_offset      = ckpt["cand_offset"]
+            log.info("  Resuming test stage after batch %d — %d / %d S1 rows already "
+                     "completed (%.1f%%).", batch_num, rows_completed, total_test_s1_rows,
+                     100 * rows_completed / max(total_test_s1_rows, 1))
+            mf = open(matching_path, "r+", encoding="utf-8", newline="")
+            cf = open(cand_path, "r+", encoding="utf-8", newline="")
+            # Discard any bytes written after the last confirmed checkpoint: this
+            # safely rewinds a batch that was interrupted mid-write, without
+            # touching any fully-completed prior batch's rows.
+            mf.seek(matching_offset)
+            mf.truncate()
+            cf.seek(cand_offset)
+            cf.truncate()
+        else:
+            batch_num        = 0
+            rows_completed   = 0
+            total_matched    = 0
+            total_cand_pairs = 0
+            elapsed_before   = 0.0
+            mf = open(matching_path, "w", encoding="utf-8", newline="")
+            cf = open(cand_path, "w", encoding="utf-8", newline="")
+            mf.write("source1_entity_id\tmatched_entity_ids\n")
+            cf.write("source1_entity_id\tcandidate_entity_ids\n")
+            mf.flush(); os.fsync(mf.fileno())
+            cf.flush(); os.fsync(cf.fileno())
+            matching_offset = mf.tell()
+            cand_offset     = cf.tell()
+            _write_checkpoint_atomic(checkpoint_path, {
+                "s1_test_batch": S1_TEST_BATCH, "max_cands": max_cands, "max_tok1": max_tok1,
+                "total_test_s1_rows": total_test_s1_rows,
+                "batch_num": 0, "rows_completed": 0,
+                "total_matched": 0, "total_cand_pairs": 0,
+                "elapsed_seconds": 0.0,
+                "matching_offset": matching_offset, "cand_offset": cand_offset,
+                "completed": False,
+            })
 
-            s1_chunk = s1_chunk.fillna("")
-            s1_chunk["norm_name"] = vec_norm_name(s1_chunk["business_name"])
-            s1_chunk["norm_addr"] = vec_norm_addr(s1_chunk["business_address"])
-            s1_chunk["tok1_name"] = s1_chunk["norm_name"].apply(tok1)
-            s1_chunk["tok2_name"] = s1_chunk["norm_name"].apply(tok2)
-            s1_batch = s1_chunk[["entity_id", "country", "business_name", "business_address",
-                                  "norm_name", "norm_addr", "tok1_name", "tok2_name"]].reset_index(drop=True)
-            del s1_chunk
+        total_s1 = rows_completed
+        t_start  = time.time() - elapsed_before
 
-            batch_ids_ordered = s1_batch["entity_id"].tolist()
-            total_s1 += len(batch_ids_ordered)
-            log.info("  [batch %d] test S1 rows: %d (cumulative %d)",
-                     batch_num, len(batch_ids_ordered), total_s1)
+        read_kwargs = dict(sep="\t", dtype=str, chunksize=S1_TEST_BATCH)
+        if rows_completed > 0:
+            # Skip S1 data rows already processed in prior runs. Row 0 is the
+            # header (kept); rows 1..rows_completed are the already-done ones.
+            read_kwargs["skiprows"] = range(1, rows_completed + 1)
 
-            # Blocking keys scoped to this S1 batch only.
-            b_countries = set(s1_batch["country"])
-            b_names     = set(s1_batch["norm_name"]) - {""}
-            b_tok2      = set(s1_batch["tok2_name"]) - {""}
-            b_tok1      = set(s1_batch["tok1_name"]) - {""}
-            b_addrs     = set(s1_batch["norm_addr"]) - {""}
+        try:
+            for s1_chunk in pd.read_csv(DATA_TEST / "test_source1.tsv", **read_kwargs):
+                batch_num += 1
+                t_batch = time.time()
 
-            # Stream S2/S3, keeping only rows relevant to this batch.
-            s23_parts = []
-            for path in [DATA_TEST / "test_source2.tsv", DATA_TEST / "test_source3.tsv"]:
-                c_num = 0
-                for chunk in pd.read_csv(path, sep="\t", dtype=str, chunksize=STREAM_CHUNK):
-                    chunk = chunk.fillna("")
-                    chunk = chunk[chunk["country"].isin(b_countries)]
-                    if chunk.empty:
+                s1_chunk = s1_chunk.fillna("")
+                s1_chunk["norm_name"] = vec_norm_name(s1_chunk["business_name"])
+                s1_chunk["norm_addr"] = vec_norm_addr(s1_chunk["business_address"])
+                s1_chunk["tok1_name"] = s1_chunk["norm_name"].apply(tok1)
+                s1_chunk["tok2_name"] = s1_chunk["norm_name"].apply(tok2)
+                s1_batch = s1_chunk[["entity_id", "country", "business_name", "business_address",
+                                      "norm_name", "norm_addr", "tok1_name", "tok2_name"]].reset_index(drop=True)
+                del s1_chunk
+
+                batch_ids_ordered = s1_batch["entity_id"].tolist()
+                batch_rows_n = len(batch_ids_ordered)
+                log.info("  [batch %d] test S1 rows: %d (cumulative %d / %d)",
+                         batch_num, batch_rows_n, total_s1 + batch_rows_n, total_test_s1_rows)
+
+                # Blocking keys scoped to this S1 batch only.
+                b_countries = set(s1_batch["country"])
+                b_names     = set(s1_batch["norm_name"]) - {""}
+                b_tok2      = set(s1_batch["tok2_name"]) - {""}
+                b_tok1      = set(s1_batch["tok1_name"]) - {""}
+                b_addrs     = set(s1_batch["norm_addr"]) - {""}
+
+                # Stream S2/S3, keeping only rows relevant to this batch.
+                s23_parts = []
+                for path in [DATA_TEST / "test_source2.tsv", DATA_TEST / "test_source3.tsv"]:
+                    c_num = 0
+                    for chunk in pd.read_csv(path, sep="\t", dtype=str, chunksize=STREAM_CHUNK):
+                        chunk = chunk.fillna("")
+                        chunk = chunk[chunk["country"].isin(b_countries)]
+                        if chunk.empty:
+                            c_num += 1
+                            continue
+                        chunk = chunk.copy()
+                        chunk["norm_name"] = vec_norm_name(chunk["business_name"])
+                        chunk["norm_addr"] = vec_norm_addr(chunk["business_address"])
+                        chunk["tok1_name"] = chunk["norm_name"].apply(tok1)
+                        chunk["tok2_name"] = chunk["norm_name"].apply(tok2)
+
+                        keep_mask = (
+                            chunk["norm_name"].isin(b_names)
+                            | chunk["tok2_name"].isin(b_tok2)
+                            | chunk["norm_addr"].isin(b_addrs)
+                            | chunk["tok1_name"].isin(b_tok1)
+                        )
+                        filtered = chunk[keep_mask]
+                        if not filtered.empty:
+                            s23_parts.append(filtered[s23_cols])
                         c_num += 1
-                        continue
-                    chunk = chunk.copy()
-                    chunk["norm_name"] = vec_norm_name(chunk["business_name"])
-                    chunk["norm_addr"] = vec_norm_addr(chunk["business_address"])
-                    chunk["tok1_name"] = chunk["norm_name"].apply(tok1)
-                    chunk["tok2_name"] = chunk["norm_name"].apply(tok2)
+                        del chunk
+                        if c_num % 10 == 0:
+                            log.info("    [batch %d] %s: chunk %d streamed...", batch_num, path.name, c_num)
 
-                    keep_mask = (
-                        chunk["norm_name"].isin(b_names)
-                        | chunk["tok2_name"].isin(b_tok2)
-                        | chunk["norm_addr"].isin(b_addrs)
-                        | chunk["tok1_name"].isin(b_tok1)
+                batch_s23 = pd.concat(s23_parts, ignore_index=True) if s23_parts else pd.DataFrame(columns=s23_cols)
+                del s23_parts, b_countries, b_names, b_tok2, b_tok1, b_addrs
+                gc.collect()
+                log.info("  [batch %d] candidate pool rows: %d (~%.1f MB)",
+                         batch_num, len(batch_s23), batch_s23.memory_usage(deep=True).sum() / 1e6)
+
+                # Blocking (reuses the existing vectorized join logic, scoped to this batch).
+                batch_cands = block_by_join(s1_batch, batch_s23, max_cands, max_tok1)
+                n_with_cands = sum(1 for v in batch_cands.values() if v)
+                log.info("  [batch %d] %d / %d S1 entities have candidates",
+                         batch_num, n_with_cands, batch_rows_n)
+
+                # Compact lookups for this batch only.
+                s1_lk_b: RecordLookup = df_to_lookup(s1_batch)
+                del s1_batch
+                gc.collect()
+
+                needed_b: Set[str] = set()
+                for v in batch_cands.values():
+                    needed_b.update(v)
+                sub_s23_b = batch_s23[batch_s23["entity_id"].isin(needed_b)]
+                s23_lk_b: RecordLookup = {
+                    eid: (norm_n, norm_a, cty, b_name, b_addr)
+                    for eid, norm_n, norm_a, cty, b_name, b_addr in zip(
+                        sub_s23_b["entity_id"], sub_s23_b["norm_name"], sub_s23_b["norm_addr"],
+                        sub_s23_b["country"], sub_s23_b["business_name"], sub_s23_b["business_address"]
                     )
-                    filtered = chunk[keep_mask]
-                    if not filtered.empty:
-                        s23_parts.append(filtered[s23_cols])
-                    c_num += 1
-                    del chunk
-                    if c_num % 10 == 0:
-                        log.info("    [batch %d] %s: chunk %d streamed...", batch_num, path.name, c_num)
+                }
+                del batch_s23, sub_s23_b, needed_b
+                gc.collect()
 
-            batch_s23 = pd.concat(s23_parts, ignore_index=True) if s23_parts else pd.DataFrame(columns=s23_cols)
-            del s23_parts, b_countries, b_names, b_tok2, b_tok1, b_addrs
-            gc.collect()
-            log.info("  [batch %d] candidate pool rows: %d (~%.1f MB)",
-                     batch_num, len(batch_s23), batch_s23.memory_usage(deep=True).sum() / 1e6)
+                # Candidate pairs for this batch (never accumulated across batches).
+                pairs_b = [(s1_id, cid) for s1_id, cset in batch_cands.items() for cid in cset]
+                batch_pairs_n = len(pairs_b)
+                log.info("  [batch %d] scoring %d candidate pairs...", batch_num, batch_pairs_n)
 
-            # Blocking (reuses the existing vectorized join logic, scoped to this batch).
-            batch_cands = block_by_join(s1_batch, batch_s23, max_cands, max_tok1)
-            n_with_cands = sum(1 for v in batch_cands.values() if v)
-            log.info("  [batch %d] %d / %d S1 entities have candidates",
-                     batch_num, n_with_cands, len(batch_ids_ordered))
+                match_map_b: Dict[str, Set[str]] = {}
+                for start in range(0, len(pairs_b), FEAT_BATCH):
+                    sub_pairs = pairs_b[start:start + FEAT_BATCH]
+                    X_b = compute_features(sub_pairs, s1_lk_b, s23_lk_b)
+                    sc_b = clf.predict_proba(X_b)[:, 1] if len(X_b) else np.array([])
+                    for (s1_id, cid), sc in zip(sub_pairs, sc_b):
+                        if sc >= best_t:
+                            match_map_b.setdefault(s1_id, set()).add(cid)
+                    del X_b, sc_b, sub_pairs
+                    if start > 0 and (start % (FEAT_BATCH * 10) == 0 or start + FEAT_BATCH >= len(pairs_b)):
+                        log.info("    [batch %d] scored %d / %d pairs", batch_num,
+                                 min(start + FEAT_BATCH, len(pairs_b)), len(pairs_b))
 
-            # Compact lookups for this batch only.
-            s1_lk_b: RecordLookup = df_to_lookup(s1_batch)
-            del s1_batch
-            gc.collect()
+                del pairs_b, s1_lk_b, s23_lk_b
+                gc.collect()
 
-            needed_b: Set[str] = set()
-            for v in batch_cands.values():
-                needed_b.update(v)
-            sub_s23_b = batch_s23[batch_s23["entity_id"].isin(needed_b)]
-            s23_lk_b: RecordLookup = {
-                eid: (norm_n, norm_a, cty, b_name, b_addr)
-                for eid, norm_n, norm_a, cty, b_name, b_addr in zip(
-                    sub_s23_b["entity_id"], sub_s23_b["norm_name"], sub_s23_b["norm_addr"],
-                    sub_s23_b["country"], sub_s23_b["business_name"], sub_s23_b["business_address"]
+                # Stream results for this batch straight to disk, preserving S1 file order.
+                for s1_id in batch_ids_ordered:
+                    matched = sorted(match_map_b.get(s1_id, set()))
+                    cset    = sorted(batch_cands.get(s1_id, set()))
+                    mf.write(f"{s1_id}\t{','.join(matched)}\n")
+                    cf.write(f"{s1_id}\t{','.join(cset)}\n")
+
+                # Crash-safe flush: force this batch's rows to durable storage
+                # BEFORE the checkpoint is advanced, so the checkpoint never
+                # claims more progress than what is actually on disk.
+                mf.flush(); os.fsync(mf.fileno())
+                cf.flush(); os.fsync(cf.fileno())
+                matching_offset = mf.tell()
+                cand_offset     = cf.tell()
+
+                batch_matched = sum(1 for v in match_map_b.values() if v)
+                total_matched    += batch_matched
+                total_cand_pairs += batch_pairs_n
+                total_s1         += batch_rows_n
+                rows_completed    = total_s1
+
+                del batch_cands, match_map_b, batch_ids_ordered
+                gc.collect()
+
+                elapsed_total = time.time() - t_start
+                progress_pct  = 100 * total_s1 / max(total_test_s1_rows, 1)
+
+                # Checkpoint is written LAST, only after both output files are
+                # confirmed durable — this is what makes a completed batch
+                # permanent and an interrupted one safe to discard and rerun.
+                _write_checkpoint_atomic(checkpoint_path, {
+                    "s1_test_batch": S1_TEST_BATCH, "max_cands": max_cands, "max_tok1": max_tok1,
+                    "total_test_s1_rows": total_test_s1_rows,
+                    "batch_num": batch_num, "rows_completed": rows_completed,
+                    "total_matched": total_matched, "total_cand_pairs": total_cand_pairs,
+                    "elapsed_seconds": elapsed_total,
+                    "matching_offset": matching_offset, "cand_offset": cand_offset,
+                    "completed": False,
+                })
+
+                log.info(
+                    "  [batch %d] S1 rows %d | cumulative %d / %d | matches %d (cum %d) | "
+                    "candidate pairs %d (cum %d) | batch time %.1fs | total time %.1fs",
+                    batch_num, batch_rows_n, total_s1, total_test_s1_rows,
+                    batch_matched, total_matched, batch_pairs_n, total_cand_pairs,
+                    time.time() - t_batch, elapsed_total,
                 )
-            }
-            del batch_s23, sub_s23_b, needed_b
-            gc.collect()
+                log.info("  Progress: %.1f%%", progress_pct)
+        finally:
+            mf.close()
+            cf.close()
 
-            # Candidate pairs for this batch (never accumulated across batches).
-            pairs_b = [(s1_id, cid) for s1_id, cset in batch_cands.items() for cid in cset]
-            total_cand_pairs += len(pairs_b)
-            log.info("  [batch %d] scoring %d candidate pairs...", batch_num, len(pairs_b))
-
-            match_map_b: Dict[str, Set[str]] = {}
-            for start in range(0, len(pairs_b), FEAT_BATCH):
-                sub_pairs = pairs_b[start:start + FEAT_BATCH]
-                X_b = compute_features(sub_pairs, s1_lk_b, s23_lk_b)
-                sc_b = clf.predict_proba(X_b)[:, 1] if len(X_b) else np.array([])
-                for (s1_id, cid), sc in zip(sub_pairs, sc_b):
-                    if sc >= best_t:
-                        match_map_b.setdefault(s1_id, set()).add(cid)
-                del X_b, sc_b, sub_pairs
-                if start > 0 and (start % (FEAT_BATCH * 10) == 0 or start + FEAT_BATCH >= len(pairs_b)):
-                    log.info("    [batch %d] scored %d / %d pairs", batch_num,
-                             min(start + FEAT_BATCH, len(pairs_b)), len(pairs_b))
-
-            del pairs_b, s1_lk_b, s23_lk_b
-            gc.collect()
-
-            # Stream results for this batch straight to disk, preserving S1 file order.
-            for s1_id in batch_ids_ordered:
-                matched = sorted(match_map_b.get(s1_id, set()))
-                cset    = sorted(batch_cands.get(s1_id, set()))
-                mf.write(f"{s1_id}\t{','.join(matched)}\n")
-                cf.write(f"{s1_id}\t{','.join(cset)}\n")
-
-            batch_matched = sum(1 for v in match_map_b.values() if v)
-            total_matched += batch_matched
-
-            del batch_cands, match_map_b, batch_ids_ordered
-            gc.collect()
-
-            log.info("  [batch %d] matched %d entities (cumulative %d / %d) — batch time %.1fs, total %.1fs",
-                     batch_num, batch_matched, total_matched, total_s1,
-                     time.time() - t_batch, time.time() - t_start)
+        if total_s1 >= total_test_s1_rows:
+            _write_checkpoint_atomic(checkpoint_path, {
+                "s1_test_batch": S1_TEST_BATCH, "max_cands": max_cands, "max_tok1": max_tok1,
+                "total_test_s1_rows": total_test_s1_rows,
+                "batch_num": batch_num, "rows_completed": total_s1,
+                "total_matched": total_matched, "total_cand_pairs": total_cand_pairs,
+                "elapsed_seconds": time.time() - t_start,
+                "matching_offset": matching_offset, "cand_offset": cand_offset,
+                "completed": True,
+            })
 
     n_singleton = total_s1 - total_matched
 
